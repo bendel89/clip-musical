@@ -380,6 +380,7 @@
     }
     .queue-item.pending { opacity: 0.5; }
     .queue-item.creating { border-color: var(--warn); box-shadow: 0 0 0 1px rgba(255,176,32,0.15); }
+    .queue-item.retrying { border-color: var(--warn); box-shadow: 0 0 0 1px rgba(255,176,32,0.35); background: rgba(255,176,32,0.05); }
     .queue-item.processing {
         border-color: var(--accent);
         box-shadow: 0 0 0 1px rgba(255,45,149,0.25), 0 0 20px rgba(255,45,149,0.15);
@@ -390,6 +391,7 @@
     .queue-item .q-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .queue-item .q-status { font-size: 0.68rem; color: var(--ink-dim); text-align: right; flex-shrink: 0; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .queue-item.failed .q-status { color: var(--error); }
+    .queue-item.retrying .q-status { color: var(--warn); }
 
     .queue-more {
         text-align: center; padding: 0.5rem; color: var(--ink-dim);
@@ -444,7 +446,7 @@
 <header>
     <h1>Clip Musical</h1>
     <p class="subtitle">Tes photos deviennent des extraits de clip</p>
-    <span class="badge-version">v1.1 · 9:16</span>
+    <span class="badge-version">v1.2 · 9:16</span>
 </header>
 
 <div class="info-banner">
@@ -525,7 +527,8 @@
             <div class="control-row">
                 <label class="control-label">Durée de chaque plan</label>
                 <select id="duration-select">
-                    <option value="121" selected>5 secondes (fiable)</option>
+                    <option value="97" selected>4 secondes (ultra-fiable)</option>
+                    <option value="121">5 secondes (fiable)</option>
                     <option value="153">6,4 secondes</option>
                     <option value="241">10 secondes (peut échouer)</option>
                 </select>
@@ -596,6 +599,10 @@ const CREATE_INTERVAL_SAFE = 95000;
 
 const POLL_INTERVAL_SEC = 8;
 const MAX_POLL_ATTEMPTS = 120;
+
+// Retry patient sur erreurs serveur
+const MAX_CREATE_RETRIES = 4;
+const RETRY_BASE_WAIT_MS = 30000; // 30s, 60s, 90s, 120s
 
 const TIMING_CACHE_KEY = 'clip_musical_timing_v1';
 const API_KEY_STORAGE = 'clip_musical_api_key';
@@ -956,7 +963,7 @@ const state = {
     mainPrompt: '',
     framing: 'random',
     intensity: 'random',
-    durationFrames: 121,
+    durationFrames: 97,
     isLoadingImages: false,
     creationAttemptsSinceLastError: 0
 };
@@ -975,7 +982,6 @@ function saveApiKey() {
     const key = input.value.trim();
     const existing = getApiKey();
 
-    // Si l'input est vide mais qu'une clé existe déjà → on garde
     if (!key && existing) {
         showToast('Clé conservée', 'success');
         input.value = '';
@@ -1073,6 +1079,9 @@ function formatEta(seconds) {
     const m = Math.floor(seconds / 60);
     const s = Math.round(seconds % 60);
     return m + 'm' + (s > 0 ? ' ' + s + 's' : '');
+}
+function isRetryableError(msg) {
+    return /HTTP 5|HTTP 429|network|Failed to fetch|timeout|503|502|500|504|load failed/i.test(msg);
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1273,32 +1282,35 @@ function buildPrompt() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// API AGNES
+// API AGNES — avec retry patient
 // ══════════════════════════════════════════════════════════════════
 async function apiFetch(url, options = {}, label = 'API') {
-    for (let attempt = 0; attempt < 7; attempt++) {
+    for (let attempt = 0; attempt < 8; attempt++) {
         if (state.stopRequested) throw new Error('Arrêt demandé');
         try {
             const res = await fetch(url, options);
+
             if (res.status === 429) {
                 state.creationAttemptsSinceLastError = 0;
                 if (createIntervalMs < CREATE_INTERVAL_SAFE) {
                     createIntervalMs = Math.min(createIntervalMs + 8000, CREATE_INTERVAL_MAX);
-                    log('429 détecté → intervalle porté à ' + (createIntervalMs / 1000) + 's');
+                    log('429 → intervalle porté à ' + (createIntervalMs / 1000) + 's');
                 }
-                const wait = [15, 30, 45, 60, 90, 120, 180][Math.min(attempt, 6)];
+                const wait = [20, 40, 60, 90, 120, 180, 240][Math.min(attempt, 6)];
                 log(label + ' : 429, attente ' + wait + 's');
-                setStatus('L\'IA se prépare… (' + wait + 's)');
+                setStatus('Trop de requêtes, attente ' + wait + 's…');
                 await sleep(wait * 1000);
                 continue;
             }
-            if (res.status === 503) {
-                const wait = [5, 10, 15, 20, 30, 45][Math.min(attempt, 5)];
-                log(label + ' : 503, attente ' + wait + 's');
-                setStatus('Ton clip se prépare… (' + wait + 's)');
+
+            if (res.status === 503 || res.status === 502 || res.status === 504) {
+                const wait = [15, 30, 60, 90, 120, 180, 240][Math.min(attempt, 6)];
+                log(label + ' : ' + res.status + ' (serveur surchargé), attente ' + wait + 's');
+                setStatus('Le serveur IA est saturé — nouvelle tentative dans ' + wait + 's…');
                 await sleep(wait * 1000);
                 continue;
             }
+
             if (res.ok && createIntervalMs > CREATE_INTERVAL_MIN) {
                 state.creationAttemptsSinceLastError++;
                 if (state.creationAttemptsSinceLastError >= 3) {
@@ -1310,7 +1322,7 @@ async function apiFetch(url, options = {}, label = 'API') {
             return res;
         } catch (e) {
             if (e.message === 'Arrêt demandé') throw e;
-            const wait = [3, 5, 8, 12, 20, 30][Math.min(attempt, 5)];
+            const wait = [5, 10, 15, 25, 40, 60][Math.min(attempt, 5)];
             log(label + ' : réseau, retry ' + wait + 's');
             setStatus('Connexion… (' + wait + 's)');
             await sleep(wait * 1000);
@@ -1431,6 +1443,7 @@ function renderQueue() {
     html += visible.map(item => {
         let icon = '○', statusText = 'En file d\'attente', cls = 'pending';
         if (item.status === 'creating') { icon = '◐'; statusText = 'Préparation…'; cls = 'creating'; }
+        else if (item.status === 'retrying') { icon = '↻'; statusText = item.progress || 'Nouvelle tentative…'; cls = 'retrying'; }
         else if (item.status === 'processing') { icon = '◐'; statusText = item.progress || 'En cours…'; cls = 'processing'; }
         else if (item.status === 'done') { icon = '●'; statusText = 'Terminé'; cls = 'done'; }
         else if (item.status === 'failed') { icon = '✕'; statusText = item.errorMsg || 'Échec'; cls = 'failed'; }
@@ -1517,12 +1530,54 @@ async function pollTaskAndDisplay(item) {
             log('[Plan ' + (item.imageIndex + 1) + '] ' + e.message);
             item.status = 'failed';
             item.progress = 'Échec';
-            item.errorMsg = 'Échec : ' + e.message.slice(0, 40);
+            item.errorMsg = 'Échec : ' + e.message.slice(0, 80);
             state.failed++;
         }
         renderQueue();
         updateGenerateBtn();
     }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// RETRY INTELLIGENT
+// ══════════════════════════════════════════════════════════════════
+async function createTaskWithRetry(item) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= MAX_CREATE_RETRIES; attempt++) {
+        if (state.stopRequested) throw new Error('Arrêt demandé');
+
+        try {
+            await createTaskOnly(item);
+            return true;
+        } catch (e) {
+            if (e.message === 'Arrêt demandé') throw e;
+            lastError = e;
+
+            const retryable = isRetryableError(e.message);
+            if (!retryable || attempt === MAX_CREATE_RETRIES) {
+                throw e;
+            }
+
+            const waitMs = RETRY_BASE_WAIT_MS * attempt;
+            const waitSec = Math.round(waitMs / 1000);
+
+            log('[Plan ' + (item.imageIndex + 1) + '] Retry ' + attempt + '/' + (MAX_CREATE_RETRIES - 1) + ' dans ' + waitSec + 's (' + e.message.slice(0, 60) + ')');
+            item.status = 'retrying';
+            item.progress = 'Tentative ' + (attempt + 1) + '/' + MAX_CREATE_RETRIES + ' dans ' + waitSec + 's';
+            item.errorMsg = null;
+            renderQueue();
+
+            for (let r = waitSec; r > 0; r--) {
+                if (state.stopRequested) throw new Error('Arrêt demandé');
+                item.progress = 'Tentative ' + (attempt + 1) + '/' + MAX_CREATE_RETRIES + ' dans ' + r + 's';
+                renderQueue();
+                await sleep(1000);
+            }
+        }
+    }
+
+    throw lastError || new Error('Échec après retries');
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1574,6 +1629,7 @@ async function startGeneration() {
     log('Démarrage — ' + state.images.length + ' clips');
     log('Prompt : ' + (state.mainPrompt ? '"' + state.mainPrompt.slice(0, 60) + '…"' : '(vide)'));
     log('Style : ' + (state.selectedEffect || 'aucun'));
+    log('Durée : ' + state.durationFrames + ' frames');
 
     const totalStart = Date.now();
     const pollingTasks = [];
@@ -1584,37 +1640,17 @@ async function startGeneration() {
             const item = state.queue[i];
 
             try {
-                await createTaskOnly(item);
+                await createTaskWithRetry(item);
                 pollingTasks.push(pollTaskAndDisplay(item));
             } catch (e) {
                 if (e.message === 'Arrêt demandé') break;
-                log('[Plan ' + (i + 1) + '] Échec création : ' + e.message);
-
-                // Retry auto si erreur réseau ou 5xx
-                const isRetryable = /HTTP 5|network|Failed to fetch|timeout|503|502|500/i.test(e.message);
-                let retried = false;
-                if (isRetryable) {
-                    log('[Plan ' + (i + 1) + '] Retry dans 8s…');
-                    await sleep(8000);
-                    try {
-                        await createTaskOnly(item);
-                        pollingTasks.push(pollTaskAndDisplay(item));
-                        retried = true;
-                    } catch (e2) {
-                        log('[Plan ' + (i + 1) + '] Retry échoué : ' + e2.message);
-                        item.errorMsg = 'Échec : ' + e2.message.slice(0, 40);
-                    }
-                } else {
-                    item.errorMsg = 'Échec : ' + e.message.slice(0, 40);
-                }
-
-                if (!retried) {
-                    item.status = 'failed';
-                    item.progress = 'Échec';
-                    state.failed++;
-                    renderQueue();
-                    updateGenerateBtn();
-                }
+                log('[Plan ' + (i + 1) + '] Échec définitif : ' + e.message);
+                item.status = 'failed';
+                item.progress = 'Échec';
+                item.errorMsg = 'Échec : ' + e.message.slice(0, 80);
+                state.failed++;
+                renderQueue();
+                updateGenerateBtn();
             }
 
             if (i < state.queue.length - 1 && !state.stopRequested) {
@@ -1727,7 +1763,7 @@ function stopGeneration() {
     renderImages();
     renderQueue();
 
-    log('Prêt — v1.1');
+    log('Prêt — v1.2');
 })();
 </script>
 
