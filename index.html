@@ -388,7 +388,8 @@
     .queue-item.failed { border-color: var(--error); }
     .queue-item .q-icon { font-size: 1rem; width: 1.5rem; text-align: center; flex-shrink: 0; }
     .queue-item .q-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .queue-item .q-status { font-size: 0.72rem; color: var(--ink-dim); text-align: right; flex-shrink: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-item .q-status { font-size: 0.68rem; color: var(--ink-dim); text-align: right; flex-shrink: 0; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-item.failed .q-status { color: var(--error); }
 
     .queue-more {
         text-align: center; padding: 0.5rem; color: var(--ink-dim);
@@ -443,7 +444,7 @@
 <header>
     <h1>Clip Musical</h1>
     <p class="subtitle">Tes photos deviennent des extraits de clip</p>
-    <span class="badge-version">v1 · 9:16</span>
+    <span class="badge-version">v1.1 · 9:16</span>
 </header>
 
 <div class="info-banner">
@@ -524,9 +525,9 @@
             <div class="control-row">
                 <label class="control-label">Durée de chaque plan</label>
                 <select id="duration-select">
-                    <option value="121">5 secondes</option>
-                    <option value="153" selected>6,4 secondes (recommandé)</option>
-                    <option value="241">10 secondes</option>
+                    <option value="121" selected>5 secondes (fiable)</option>
+                    <option value="153">6,4 secondes</option>
+                    <option value="241">10 secondes (peut échouer)</option>
                 </select>
             </div>
             <div class="control-row">
@@ -588,13 +589,13 @@ const POLL_BASE = 'https://apihub.agnes-ai.com/agnesapi';
 const MODEL_VIDEO = 'agnes-video-v2.0';
 const FRAME_RATE = 24;
 
-let createIntervalMs = 62000;
-const CREATE_INTERVAL_MIN = 62000;
-const CREATE_INTERVAL_MAX = 90000;
-const CREATE_INTERVAL_SAFE = 75000;
+let createIntervalMs = 80000;
+const CREATE_INTERVAL_MIN = 80000;
+const CREATE_INTERVAL_MAX = 120000;
+const CREATE_INTERVAL_SAFE = 95000;
 
 const POLL_INTERVAL_SEC = 8;
-const MAX_POLL_ATTEMPTS = 100;
+const MAX_POLL_ATTEMPTS = 120;
 
 const TIMING_CACHE_KEY = 'clip_musical_timing_v1';
 const API_KEY_STORAGE = 'clip_musical_api_key';
@@ -830,7 +831,7 @@ function updateTimingDisplay() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// PRESETS DE PROMPT — Ambiance clip musical
+// PRESETS DE PROMPT
 // ══════════════════════════════════════════════════════════════════
 const PROMPT_PRESETS = [
     { label: '🎤 Rap nocturne',
@@ -890,7 +891,7 @@ const CLIP_STYLES = [
 ];
 
 // ══════════════════════════════════════════════════════════════════
-// MOUVEMENTS — CLIP
+// MOUVEMENTS
 // ══════════════════════════════════════════════════════════════════
 const RANDOM_ACTIONS = [
     'the subject bobs their head slowly to an invisible beat',
@@ -955,7 +956,7 @@ const state = {
     mainPrompt: '',
     framing: 'random',
     intensity: 'random',
-    durationFrames: 153,
+    durationFrames: 121,
     isLoadingImages: false,
     creationAttemptsSinceLastError: 0
 };
@@ -972,11 +973,18 @@ function saveApiKey() {
     const input = document.getElementById('api-key-input');
     if (!input) return;
     const key = input.value.trim();
+    const existing = getApiKey();
 
-    if (!key) {
-        try { localStorage.removeItem(API_KEY_STORAGE); } catch (e) {}
-        updateApiPanel();
-        showToast('Clé supprimée', 'warn');
+    // Si l'input est vide mais qu'une clé existe déjà → on garde
+    if (!key && existing) {
+        showToast('Clé conservée', 'success');
+        input.value = '';
+        input.placeholder = 'Clé enregistrée (tape une nouvelle clé pour la remplacer)';
+        return;
+    }
+
+    if (!key && !existing) {
+        showToast('Aucune clé à enregistrer', 'warn');
         return;
     }
 
@@ -988,6 +996,7 @@ function saveApiKey() {
         localStorage.setItem(API_KEY_STORAGE, key);
         updateApiPanel();
         showToast('Clé API enregistrée ✓', 'success');
+        input.value = '';
         input.blur();
     } catch (e) {
         showToast('Erreur lors de la sauvegarde', 'error');
@@ -1006,9 +1015,9 @@ function updateApiPanel() {
     if (key) {
         panel.classList.add('ok');
         statusLine.classList.add('ok');
-        statusText.textContent = 'Clé API active · ' + key.slice(0, 8) + '…' + key.slice(-4);
-        input.value = key;
-        input.placeholder = '';
+        statusText.textContent = 'Clé API active · ' + key.slice(0, 6) + '…' + key.slice(-4);
+        input.value = '';
+        input.placeholder = 'Clé enregistrée (tape une nouvelle clé pour la remplacer)';
     } else {
         panel.classList.remove('ok');
         statusLine.classList.remove('ok');
@@ -1329,13 +1338,19 @@ async function createVideoTask(imageDataUri, prompt) {
     }, 'Création');
 
     if (!res.ok) {
-        const err = await res.text();
-        throw new Error('HTTP ' + res.status + ' — ' + err.slice(0, 200));
+        let errMsg = 'HTTP ' + res.status;
+        try {
+            const errText = await res.text();
+            errMsg += ' — ' + errText.slice(0, 200);
+        } catch (e) {}
+        throw new Error(errMsg);
     }
 
     const data = await res.json();
     const videoId = data.video_id || data.id || data.task_id;
-    if (!videoId) throw new Error('Pas de video_id retourné');
+    if (!videoId) {
+        throw new Error('Pas de video_id : ' + JSON.stringify(data).slice(0, 150));
+    }
     return videoId;
 }
 
@@ -1418,7 +1433,7 @@ function renderQueue() {
         if (item.status === 'creating') { icon = '◐'; statusText = 'Préparation…'; cls = 'creating'; }
         else if (item.status === 'processing') { icon = '◐'; statusText = item.progress || 'En cours…'; cls = 'processing'; }
         else if (item.status === 'done') { icon = '●'; statusText = 'Terminé'; cls = 'done'; }
-        else if (item.status === 'failed') { icon = '✕'; statusText = 'Échec'; cls = 'failed'; }
+        else if (item.status === 'failed') { icon = '✕'; statusText = item.errorMsg || 'Échec'; cls = 'failed'; }
 
         return '<div class="queue-item ' + cls + '">' +
             '<div class="q-icon">' + icon + '</div>' +
@@ -1456,6 +1471,7 @@ function addToGallery(videoUrl, label) {
 async function createTaskOnly(item) {
     item.status = 'creating';
     item.progress = 'Préparation…';
+    item.errorMsg = null;
     renderQueue();
 
     const prompt = buildPrompt();
@@ -1496,10 +1512,12 @@ async function pollTaskAndDisplay(item) {
         if (e.message === 'Arrêt demandé') {
             item.status = 'failed';
             item.progress = 'Arrêté';
+            item.errorMsg = 'Arrêté';
         } else {
             log('[Plan ' + (item.imageIndex + 1) + '] ' + e.message);
             item.status = 'failed';
             item.progress = 'Échec';
+            item.errorMsg = 'Échec : ' + e.message.slice(0, 40);
             state.failed++;
         }
         renderQueue();
@@ -1539,7 +1557,8 @@ async function startGeneration() {
         videoId: null,
         videoUrl: null,
         prompt: null,
-        startTime: null
+        startTime: null,
+        errorMsg: null
     }));
 
     document.getElementById('gallery-grid').innerHTML = '';
@@ -1569,12 +1588,33 @@ async function startGeneration() {
                 pollingTasks.push(pollTaskAndDisplay(item));
             } catch (e) {
                 if (e.message === 'Arrêt demandé') break;
-                log('[Plan ' + (i + 1) + '] Échec : ' + e.message);
-                item.status = 'failed';
-                item.progress = 'Échec';
-                state.failed++;
-                renderQueue();
-                updateGenerateBtn();
+                log('[Plan ' + (i + 1) + '] Échec création : ' + e.message);
+
+                // Retry auto si erreur réseau ou 5xx
+                const isRetryable = /HTTP 5|network|Failed to fetch|timeout|503|502|500/i.test(e.message);
+                let retried = false;
+                if (isRetryable) {
+                    log('[Plan ' + (i + 1) + '] Retry dans 8s…');
+                    await sleep(8000);
+                    try {
+                        await createTaskOnly(item);
+                        pollingTasks.push(pollTaskAndDisplay(item));
+                        retried = true;
+                    } catch (e2) {
+                        log('[Plan ' + (i + 1) + '] Retry échoué : ' + e2.message);
+                        item.errorMsg = 'Échec : ' + e2.message.slice(0, 40);
+                    }
+                } else {
+                    item.errorMsg = 'Échec : ' + e.message.slice(0, 40);
+                }
+
+                if (!retried) {
+                    item.status = 'failed';
+                    item.progress = 'Échec';
+                    state.failed++;
+                    renderQueue();
+                    updateGenerateBtn();
+                }
             }
 
             if (i < state.queue.length - 1 && !state.stopRequested) {
@@ -1687,7 +1727,7 @@ function stopGeneration() {
     renderImages();
     renderQueue();
 
-    log('Prêt.');
+    log('Prêt — v1.1');
 })();
 </script>
 
